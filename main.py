@@ -1,13 +1,15 @@
 import os
 import asyncio
 import logging
+import hmac
+import hashlib
+import time
+import json
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-import gate_api
-from gate_api.exceptions import ApiException, GateApiException
-import math
+import requests
 from typing import Dict, List, Tuple
 
 # 加載環境變數
@@ -21,10 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Gate.io API 配置
-configuration = gate_api.Configuration(
-    key=os.getenv("GATE_API_KEY"),
-    secret=os.getenv("GATE_API_SECRET")
-)
+GATE_API_KEY = os.getenv("GATE_API_KEY")
+GATE_API_SECRET = os.getenv("GATE_API_SECRET")
+GATE_BASE_URL = "https://api.gateio.ws/api/v4"
 
 # 會話狀態
 SELECTING_SYMBOL, SELECTING_LEVERAGE, SELECTING_MARGIN, SELECTING_ENTRY_PRICE, SELECTING_ROLL_COUNT, SELECTING_ORDER_TYPE, CONFIRMATION = range(7)
@@ -32,18 +33,92 @@ SELECTING_SYMBOL, SELECTING_LEVERAGE, SELECTING_MARGIN, SELECTING_ENTRY_PRICE, S
 # 用戶數據存儲
 user_data = {}
 
+class GateIOAPI:
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = GATE_BASE_URL
+    
+    def _sign_request(self, method: str, url: str, query_string: str = None, body: str = None) -> Dict[str, str]:
+        """簽名請求"""
+        timestamp = str(time.time())
+        body_hash = hashlib.sha512((body or "").encode()).hexdigest()
+        
+        if query_string:
+            signature_string = f"{method}\n{url}\n{query_string}\n{body_hash}\n{timestamp}"
+        else:
+            signature_string = f"{method}\n{url}\n\n{body_hash}\n{timestamp}"
+        
+        signature = hmac.new(
+            self.api_secret.encode(), 
+            signature_string.encode(), 
+            hashlib.sha512
+        ).hexdigest()
+        
+        return {
+            "KEY": self.api_key,
+            "Timestamp": timestamp,
+            "SIGN": signature
+        }
+    
+    def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None):
+        """發送API請求"""
+        url = f"{self.base_url}{endpoint}"
+        query_string = ""
+        body = ""
+        
+        if params:
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        if data:
+            body = json.dumps(data)
+        
+        headers = self._sign_request(method, endpoint, query_string, body)
+        headers["Content-Type"] = "application/json"
+        
+        if method == "GET":
+            response = requests.get(f"{url}?{query_string}", headers=headers)
+        elif method == "POST":
+            response = requests.post(url, headers=headers, data=body)
+        elif method == "DELETE":
+            response = requests.delete(f"{url}?{query_string}", headers=headers)
+        else:
+            raise ValueError(f"不支持的HTTP方法: {method}")
+        
+        if response.status_code != 200:
+            raise Exception(f"API錯誤: {response.status_code} - {response.text}")
+        
+        return response.json()
+    
+    def get_ticker(self, symbol: str) -> Dict:
+        """獲取交易對價格"""
+        return self._request("GET", "/futures/usdt/tickers", {"contract": symbol})
+    
+    def set_leverage(self, symbol: str, leverage: int) -> Dict:
+        """設置槓桿"""
+        return self._request("POST", "/futures/usdt/leverage", 
+                           data={"contract": symbol, "leverage": str(leverage)})
+    
+    def place_order(self, symbol: str, size: int, price: str, tif: str = "ioc") -> Dict:
+        """下單"""
+        order_data = {
+            "contract": symbol,
+            "size": size,
+            "price": price,
+            "tif": tif
+        }
+        return self._request("POST", "/futures/usdt/orders", data=order_data)
+    
+    def get_contract_info(self, symbol: str) -> Dict:
+        """獲取合約信息"""
+        return self._request("GET", "/futures/usdt/contracts", {"contract": symbol})
+
 class RolloverBot:
     def __init__(self):
-        self.api_client = gate_api.ApiClient(configuration)
-        self.futures_api = gate_api.FuturesApi(self.api_client)
+        self.api = GateIOAPI(GATE_API_KEY, GATE_API_SECRET)
         
     def calculate_contract_size(self, symbol: str, price: float, margin: float, leverage: int) -> int:
         """計算合約數量（張數）"""
         try:
-            # 獲取合約信息
-            contracts = self.futures_api.list_futures_contracts(symbol)
-            contract = contracts[0]
-            
             # 計算合約價值
             contract_value = margin * leverage
             # 計算合約數量（張數）
@@ -57,8 +132,8 @@ class RolloverBot:
     async def get_current_price(self, symbol: str) -> float:
         """獲取當前價格"""
         try:
-            tickers = self.futures_api.list_futures_tickers(symbol)
-            return float(tickers[0].last)
+            ticker = self.api.get_ticker(symbol)
+            return float(ticker[0]['last'])
         except Exception as e:
             logger.error(f"獲取價格錯誤: {e}")
             return 0.0
@@ -67,17 +142,10 @@ class RolloverBot:
         """下市價單"""
         try:
             # 設置槓桿
-            leverage_str = f"{leverage}"
-            self.futures_api.update_position_leverage(symbol, leverage_str)
+            self.api.set_leverage(symbol, leverage)
             
-            # 下單
-            order = gate_api.FuturesOrder(
-                contract=symbol,
-                size=contract_size,
-                price="0",  # 市價單
-                tif="ioc"
-            )
-            result = self.futures_api.create_futures_order(order)
+            # 下單（市價單價格設為"0"）
+            result = self.api.place_order(symbol, contract_size, "0", "ioc")
             return True
         except Exception as e:
             logger.error(f"下單錯誤: {e}")
@@ -87,17 +155,10 @@ class RolloverBot:
         """下限價單"""
         try:
             # 設置槓桿
-            leverage_str = f"{leverage}"
-            self.futures_api.update_position_leverage(symbol, leverage_str)
+            self.api.set_leverage(symbol, leverage)
             
             # 下單
-            order = gate_api.FuturesOrder(
-                contract=symbol,
-                size=contract_size,
-                price=str(price),
-                tif="gtc"
-            )
-            result = self.futures_api.create_futures_order(order)
+            result = self.api.place_order(symbol, contract_size, str(price), "gtc")
             return True
         except Exception as e:
             logger.error(f"下單錯誤: {e}")
@@ -366,6 +427,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """主函數"""
+    # 檢查環境變數
+    if not os.getenv("TELEGRAM_BOT_TOKEN"):
+        logger.error("請設置 TELEGRAM_BOT_TOKEN 環境變數")
+        return
+    
+    if not os.getenv("GATE_API_KEY") or not os.getenv("GATE_API_SECRET"):
+        logger.error("請設置 GATE_API_KEY 和 GATE_API_SECRET 環境變數")
+        return
+    
     # 創建應用程序
     application = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     
