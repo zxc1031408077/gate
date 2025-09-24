@@ -562,18 +562,14 @@ async def main():
     try:
         # 启动机器人
         logger.info("启动 Gate.io 滚仓机器人...")
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
         
-        # 保持运行
-        await application.updater.idle()
+        # 使用 run_polling 方法（新版本的正确用法）
+        await application.run_polling(drop_pending_updates=True)
         
     except Exception as e:
         logger.error(f"机器人运行错误: {str(e)}")
     finally:
         await gate_api.close_session()
-        await application.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
