@@ -181,24 +181,28 @@ class RolloverBot:
                                 leverage: int, roll_count: int, symbol: str) -> List[Dict]:
         """計算滾倉訂單"""
         orders = []
-        current_price = entry_price
+        
+        # 將輸入轉換為Decimal以避免浮點數精度問題
+        current_price = Decimal(str(entry_price))
+        margin_dec = Decimal(str(margin))
+        leverage_dec = Decimal(str(leverage))
         
         # 計算初始合約數量
-        initial_contract_size = self.calculate_contract_size(symbol, entry_price, margin, leverage)
+        initial_contract_size = self.calculate_contract_size(symbol, float(current_price), float(margin_dec), int(leverage_dec))
         
         for i in range(roll_count):
             # 計算下一次滾倉價格（上漲2%）
             rollover_price = current_price * Decimal('1.02')
-            rollover_price = float(rollover_price.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
+            rollover_price_float = float(rollover_price.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
             
             # 使用相同的合約數量
             contract_size = initial_contract_size
             
             orders.append({
                 'rollover_number': i + 1,
-                'price': rollover_price,
+                'price': rollover_price_float,
                 'contract_size': contract_size,
-                'margin_required': contract_size * rollover_price / leverage
+                'margin_required': contract_size * rollover_price_float / int(leverage)
             })
             
             current_price = rollover_price
@@ -344,26 +348,31 @@ async def order_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     leverage = user_data[user_id]['leverage']
     roll_count = user_data[user_id]['roll_count']
     
-    orders = bot.calculate_rollover_orders(entry_price, margin, leverage, roll_count, symbol)
-    user_data[user_id]['orders'] = orders
-    
-    # 顯示訂單摘要
-    summary = f"📊 訂單摘要:\n\n"
-    summary += f"交易對: {symbol}\n"
-    summary += f"槓桿: {leverage}x\n"
-    summary += f"保證金: {margin} USDT\n"
-    summary += f"進場價格: {entry_price}\n"
-    summary += f"下單方式: {order_type}\n"
-    summary += f"滾倉次數: {roll_count}\n\n"
-    summary += "📈 滾倉訂單:\n"
-    
-    for order in orders:
-        summary += f"第{order['rollover_number']}次: 價格${order['price']:.2f}, 合約{order['contract_size']}張\n"
-    
-    summary += "\n確認執行？(是/否)"
-    
-    await update.message.reply_text(summary)
-    return CONFIRMATION
+    try:
+        orders = bot.calculate_rollover_orders(entry_price, margin, leverage, roll_count, symbol)
+        user_data[user_id]['orders'] = orders
+        
+        # 顯示訂單摘要
+        summary = f"📊 訂單摘要:\n\n"
+        summary += f"交易對: {symbol}\n"
+        summary += f"槓桿: {leverage}x\n"
+        summary += f"保證金: {margin} USDT\n"
+        summary += f"進場價格: {entry_price}\n"
+        summary += f"下單方式: {order_type}\n"
+        summary += f"滾倉次數: {roll_count}\n\n"
+        summary += "📈 滾倉訂單:\n"
+        
+        for order in orders:
+            summary += f"第{order['rollover_number']}次: 價格${order['price']:.2f}, 合約{order['contract_size']}張\n"
+        
+        summary += "\n確認執行？(是/否)"
+        
+        await update.message.reply_text(summary)
+        return CONFIRMATION
+    except Exception as e:
+        logger.error(f"計算滾倉訂單錯誤: {e}")
+        await update.message.reply_text(f"❌ 計算滾倉訂單時發生錯誤: {str(e)}")
+        return ConversationHandler.END
 
 async def confirmation_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """接收確認"""
