@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 import json
+import urllib.parse
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
@@ -39,51 +40,59 @@ class GateIOAPI:
         self.api_secret = api_secret
         self.base_url = GATE_BASE_URL
     
-    def _sign_request(self, method: str, url: str, query_string: str = None, body: str = None) -> Dict[str, str]:
-        """簽名請求"""
-        timestamp = str(time.time())
-        body_hash = hashlib.sha512((body or "").encode()).hexdigest()
-        
-        if query_string:
-            signature_string = f"{method}\n{url}\n{query_string}\n{body_hash}\n{timestamp}"
-        else:
-            signature_string = f"{method}\n{url}\n\n{body_hash}\n{timestamp}"
-        
-        signature = hmac.new(
-            self.api_secret.encode(), 
-            signature_string.encode(), 
-            hashlib.sha512
-        ).hexdigest()
+    def _sign_request(self, method: str, endpoint: str, query_string: str = "", payload: str = "") -> Dict[str, str]:
+        """簽名請求 - 根據 Gate.io 文檔修正簽名算法"""
+        t = time.time()
+        m = hashlib.sha512()
+        m.update(payload.encode('utf-8'))
+        hashed_payload = m.hexdigest()
+        s = '%s\n%s\n%s\n%s\n%s' % (method, endpoint, query_string, hashed_payload, t)
+        sign = hmac.new(self.api_secret.encode('utf-8'), s.encode('utf-8'), hashlib.sha512).hexdigest()
         
         return {
             "KEY": self.api_key,
-            "Timestamp": timestamp,
-            "SIGN": signature
+            "Timestamp": str(t),
+            "SIGN": sign
         }
     
     def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None):
         """發送API請求"""
         url = f"{self.base_url}{endpoint}"
+        
+        # 處理查詢字符串
         query_string = ""
-        body = ""
-        
         if params:
-            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        if data:
-            body = json.dumps(data)
+            # 對參數進行排序
+            sorted_params = sorted(params.items())
+            query_string = urllib.parse.urlencode(sorted_params)
         
-        headers = self._sign_request(method, endpoint, query_string, body)
+        # 處理請求體
+        payload = ""
+        if data:
+            payload = json.dumps(data)
+        
+        # 生成簽名
+        headers = self._sign_request(method, endpoint, query_string, payload)
         headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        
+        # 構建完整URL
+        full_url = url
+        if query_string:
+            full_url = f"{url}?{query_string}"
         
         try:
             if method == "GET":
-                response = requests.get(f"{url}?{query_string}", headers=headers, timeout=10)
+                response = requests.get(full_url, headers=headers, timeout=10)
             elif method == "POST":
-                response = requests.post(url, headers=headers, data=body, timeout=10)
+                response = requests.post(url, headers=headers, data=payload, timeout=10)
             elif method == "DELETE":
-                response = requests.delete(f"{url}?{query_string}", headers=headers, timeout=10)
+                response = requests.delete(full_url, headers=headers, timeout=10)
             else:
                 raise ValueError(f"不支持的HTTP方法: {method}")
+            
+            logger.info(f"API響應狀態碼: {response.status_code}")
+            logger.info(f"API響應內容: {response.text}")
             
             if response.status_code != 200:
                 raise Exception(f"API錯誤: {response.status_code} - {response.text}")
@@ -105,9 +114,13 @@ class GateIOAPI:
     
     def place_order(self, symbol: str, size: int, price: str, tif: str = "ioc") -> Dict:
         """下單"""
+        # 確保size是正確的符號（正數表示買入，負數表示賣出）
+        # 由於我們只做多，size應該是正數
+        order_size = abs(size)
+        
         order_data = {
             "contract": symbol,
-            "size": size,
+            "size": order_size,
             "price": price,
             "tif": tif
         }
@@ -399,12 +412,22 @@ async def execute_rollover_strategy(update: Update, user_id: int):
         
         await update.message.reply_text("🚀 開始執行滾倉策略...")
         
+        # 先測試API連接
+        try:
+            ticker = bot.api.get_ticker(symbol)
+            await update.message.reply_text(f"✅ API連接測試成功，當前價格: {ticker[0]['last']}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ API連接測試失敗: {str(e)}")
+            return
+        
         # 下初始訂單
         initial_contract_size = bot.calculate_contract_size(symbol, entry_price, margin, leverage)
         
         if initial_contract_size <= 0:
             await update.message.reply_text("❌ 合約數量計算錯誤，請檢查參數")
             return
+        
+        await update.message.reply_text(f"📊 初始訂單詳情:\n合約數量: {initial_contract_size}張\n槓桿: {leverage}x")
         
         if order_type == '市價單':
             success = await bot.place_market_order(symbol, initial_contract_size, leverage)
@@ -474,6 +497,10 @@ def main():
     # 檢查環境變數
     if not os.getenv("TELEGRAM_BOT_TOKEN"):
         logger.error("請設置 TELEGRAM_BOT_TOKEN 環境變數")
+        return
+    
+    if not GATE_API_KEY or not GATE_API_SECRET:
+        logger.error("請設置 GATE_API_KEY 和 GATE_API_SECRET 環境變數")
         return
     
     # 創建應用程序
