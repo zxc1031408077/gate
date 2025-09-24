@@ -40,18 +40,22 @@ class GateIOAPI:
         self.api_secret = api_secret
         self.base_url = GATE_BASE_URL
     
-    def _sign_request(self, method: str, url_path: str, query_string: str = "", body: str = "") -> Dict[str, str]:
+    def _sign_request(self, method: str, endpoint: str, query_string: str = "", payload: str = "") -> Dict[str, str]:
         """根據 Gate.io 官方文檔實現簽名算法"""
-        timestamp = str(time.time())
+        # 使用整數時間戳
+        timestamp = str(int(time.time()))
         
         # 計算 payload 的 SHA512 哈希
-        if body:
-            hashed_payload = hashlib.sha512(body.encode()).hexdigest()
+        if payload:
+            hashed_payload = hashlib.sha512(payload.encode('utf-8')).hexdigest()
         else:
             hashed_payload = hashlib.sha512().hexdigest()
         
-        # 構建簽名字符串
-        signature_string = f"{method}\n{url_path}\n{query_string}\n{hashed_payload}\n{timestamp}"
+        # 構建簽名字符串 - 注意格式必須精確
+        if query_string:
+            signature_string = f"{method}\n{endpoint}\n{query_string}\n{hashed_payload}\n{timestamp}"
+        else:
+            signature_string = f"{method}\n{endpoint}\n\n{hashed_payload}\n{timestamp}"
         
         # 使用 HMAC-SHA512 計算簽名
         signature = hmac.new(
@@ -78,12 +82,12 @@ class GateIOAPI:
             query_string = urllib.parse.urlencode(sorted_params)
         
         # 處理請求體
-        body = ""
+        payload = ""
         if data:
-            body = json.dumps(data, separators=(',', ':'))  # 緊湊的JSON格式
+            payload = json.dumps(data, separators=(',', ':'))  # 緊湊的JSON格式
         
         # 生成簽名
-        headers = self._sign_request(method, endpoint, query_string, body)
+        headers = self._sign_request(method, endpoint, query_string, payload)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
         
@@ -94,20 +98,17 @@ class GateIOAPI:
         
         try:
             logger.info(f"發送 {method} 請求到 {full_url}")
-            logger.info(f"請求頭: { {k: v for k, v in headers.items() if k != 'SIGN'} }")
-            logger.info(f"請求體: {body}")
             
             if method == "GET":
                 response = requests.get(full_url, headers=headers, timeout=10)
             elif method == "POST":
-                response = requests.post(url, headers=headers, data=body, timeout=10)
+                response = requests.post(url, headers=headers, data=payload, timeout=10)
             elif method == "DELETE":
                 response = requests.delete(full_url, headers=headers, timeout=10)
             else:
                 raise ValueError(f"不支持的HTTP方法: {method}")
             
             logger.info(f"API響應狀態碼: {response.status_code}")
-            logger.info(f"API響應內容: {response.text}")
             
             if response.status_code != 200:
                 # 嘗試解析錯誤信息
@@ -130,26 +131,8 @@ class GateIOAPI:
         return self._request("GET", "/futures/usdt/tickers", {"contract": symbol})
     
     def set_leverage(self, symbol: str, leverage: int) -> Dict:
-        """設置槓桿"""
-        # 先獲取當前持倉信息來確定方向
-        try:
-            positions = self._request("GET", "/futures/usdt/positions", {"contract": symbol})
-            if positions and len(positions) > 0:
-                # 如果有持倉，使用相同方向
-                size = int(positions[0].get('size', 0))
-                if size != 0:
-                    # 保持相同方向
-                    leverage_data = {"contract": symbol, "leverage": str(leverage)}
-                else:
-                    # 新持倉，使用正數（做多）
-                    leverage_data = {"contract": symbol, "leverage": str(leverage)}
-            else:
-                # 新持倉，使用正數（做多）
-                leverage_data = {"contract": symbol, "leverage": str(leverage)}
-        except:
-            # 如果獲取持倉失敗，使用默認設置
-            leverage_data = {"contract": symbol, "leverage": str(leverage)}
-        
+        """設置槓桿 - 簡化版本，不檢查持倉"""
+        leverage_data = {"contract": symbol, "leverage": str(leverage)}
         return self._request("POST", "/futures/usdt/leverage", data=leverage_data)
     
     def place_order(self, symbol: str, size: int, price: str, tif: str = "ioc") -> Dict:
@@ -202,10 +185,12 @@ class RolloverBot:
         """下市價單"""
         try:
             # 設置槓桿
-            self.api.set_leverage(symbol, leverage)
+            await asyncio.get_event_loop().run_in_executor(None, self.api.set_leverage, symbol, leverage)
             
             # 下單（市價單價格設為"0"）
-            result = self.api.place_order(symbol, contract_size, "0", "ioc")
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, self.api.place_order, symbol, contract_size, "0", "ioc"
+            )
             logger.info(f"市價單下單結果: {result}")
             return True
         except Exception as e:
@@ -216,10 +201,12 @@ class RolloverBot:
         """下限價單"""
         try:
             # 設置槓桿
-            self.api.set_leverage(symbol, leverage)
+            await asyncio.get_event_loop().run_in_executor(None, self.api.set_leverage, symbol, leverage)
             
             # 下單
-            result = self.api.place_order(symbol, contract_size, str(price), "gtc")
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, self.api.place_order, symbol, contract_size, str(price), "gtc"
+            )
             logger.info(f"限價單下單結果: {result}")
             return True
         except Exception as e:
@@ -233,11 +220,9 @@ class RolloverBot:
         
         # 將輸入轉換為Decimal以避免浮點數精度問題
         current_price = Decimal(str(entry_price))
-        margin_dec = Decimal(str(margin))
-        leverage_dec = Decimal(str(leverage))
         
         # 計算初始合約數量
-        initial_contract_size = self.calculate_contract_size(symbol, float(current_price), float(margin_dec), int(leverage_dec))
+        initial_contract_size = self.calculate_contract_size(symbol, float(current_price), margin, leverage)
         
         for i in range(roll_count):
             # 計算下一次滾倉價格（上漲2%）
@@ -251,7 +236,7 @@ class RolloverBot:
                 'rollover_number': i + 1,
                 'price': rollover_price_float,
                 'contract_size': contract_size,
-                'margin_required': contract_size * rollover_price_float / int(leverage)
+                'margin_required': contract_size * rollover_price_float / leverage
             })
             
             current_price = rollover_price
@@ -450,7 +435,7 @@ async def execute_rollover_strategy(update: Update, user_id: int):
         
         # 先測試API連接
         try:
-            ticker = bot.api.get_ticker(symbol)
+            ticker = await asyncio.get_event_loop().run_in_executor(None, bot.api.get_ticker, symbol)
             await update.message.reply_text(f"✅ API連接測試成功，當前價格: {ticker[0]['last']}")
         except Exception as e:
             await update.message.reply_text(f"❌ API連接測試失敗: {str(e)}")
@@ -459,7 +444,9 @@ async def execute_rollover_strategy(update: Update, user_id: int):
         # 測試設置槓桿
         try:
             await update.message.reply_text("🔧 測試設置槓桿...")
-            leverage_result = bot.api.set_leverage(symbol, leverage)
+            leverage_result = await asyncio.get_event_loop().run_in_executor(
+                None, bot.api.set_leverage, symbol, leverage
+            )
             await update.message.reply_text(f"✅ 槓桿設置測試成功")
         except Exception as e:
             await update.message.reply_text(f"❌ 槓桿設置測試失敗: {str(e)}")
