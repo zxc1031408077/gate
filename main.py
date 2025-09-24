@@ -40,19 +40,30 @@ class GateIOAPI:
         self.api_secret = api_secret
         self.base_url = GATE_BASE_URL
     
-    def _sign_request(self, method: str, endpoint: str, query_string: str = "", payload: str = "") -> Dict[str, str]:
-        """簽名請求 - 根據 Gate.io 文檔修正簽名算法"""
-        t = time.time()
-        m = hashlib.sha512()
-        m.update(payload.encode('utf-8'))
-        hashed_payload = m.hexdigest()
-        s = '%s\n%s\n%s\n%s\n%s' % (method, endpoint, query_string, hashed_payload, t)
-        sign = hmac.new(self.api_secret.encode('utf-8'), s.encode('utf-8'), hashlib.sha512).hexdigest()
+    def _sign_request(self, method: str, url_path: str, query_string: str = "", body: str = "") -> Dict[str, str]:
+        """根據 Gate.io 官方文檔實現簽名算法"""
+        timestamp = str(time.time())
+        
+        # 計算 payload 的 SHA512 哈希
+        if body:
+            hashed_payload = hashlib.sha512(body.encode()).hexdigest()
+        else:
+            hashed_payload = hashlib.sha512().hexdigest()
+        
+        # 構建簽名字符串
+        signature_string = f"{method}\n{url_path}\n{query_string}\n{hashed_payload}\n{timestamp}"
+        
+        # 使用 HMAC-SHA512 計算簽名
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            signature_string.encode('utf-8'),
+            hashlib.sha512
+        ).hexdigest()
         
         return {
             "KEY": self.api_key,
-            "Timestamp": str(t),
-            "SIGN": sign
+            "Timestamp": timestamp,
+            "SIGN": signature
         }
     
     def _request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None):
@@ -62,17 +73,17 @@ class GateIOAPI:
         # 處理查詢字符串
         query_string = ""
         if params:
-            # 對參數進行排序
+            # 對參數進行排序並編碼
             sorted_params = sorted(params.items())
             query_string = urllib.parse.urlencode(sorted_params)
         
         # 處理請求體
-        payload = ""
+        body = ""
         if data:
-            payload = json.dumps(data)
+            body = json.dumps(data, separators=(',', ':'))  # 緊湊的JSON格式
         
         # 生成簽名
-        headers = self._sign_request(method, endpoint, query_string, payload)
+        headers = self._sign_request(method, endpoint, query_string, body)
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
         
@@ -82,10 +93,14 @@ class GateIOAPI:
             full_url = f"{url}?{query_string}"
         
         try:
+            logger.info(f"發送 {method} 請求到 {full_url}")
+            logger.info(f"請求頭: { {k: v for k, v in headers.items() if k != 'SIGN'} }")
+            logger.info(f"請求體: {body}")
+            
             if method == "GET":
                 response = requests.get(full_url, headers=headers, timeout=10)
             elif method == "POST":
-                response = requests.post(url, headers=headers, data=payload, timeout=10)
+                response = requests.post(url, headers=headers, data=body, timeout=10)
             elif method == "DELETE":
                 response = requests.delete(full_url, headers=headers, timeout=10)
             else:
@@ -95,7 +110,14 @@ class GateIOAPI:
             logger.info(f"API響應內容: {response.text}")
             
             if response.status_code != 200:
-                raise Exception(f"API錯誤: {response.status_code} - {response.text}")
+                # 嘗試解析錯誤信息
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('message', 'Unknown error')
+                    error_label = error_data.get('label', '')
+                    raise Exception(f"API錯誤 {response.status_code}: {error_label} - {error_msg}")
+                except:
+                    raise Exception(f"API錯誤 {response.status_code}: {response.text}")
             
             return response.json()
         except requests.exceptions.Timeout:
@@ -109,13 +131,30 @@ class GateIOAPI:
     
     def set_leverage(self, symbol: str, leverage: int) -> Dict:
         """設置槓桿"""
-        return self._request("POST", "/futures/usdt/leverage", 
-                           data={"contract": symbol, "leverage": str(leverage)})
+        # 先獲取當前持倉信息來確定方向
+        try:
+            positions = self._request("GET", "/futures/usdt/positions", {"contract": symbol})
+            if positions and len(positions) > 0:
+                # 如果有持倉，使用相同方向
+                size = int(positions[0].get('size', 0))
+                if size != 0:
+                    # 保持相同方向
+                    leverage_data = {"contract": symbol, "leverage": str(leverage)}
+                else:
+                    # 新持倉，使用正數（做多）
+                    leverage_data = {"contract": symbol, "leverage": str(leverage)}
+            else:
+                # 新持倉，使用正數（做多）
+                leverage_data = {"contract": symbol, "leverage": str(leverage)}
+        except:
+            # 如果獲取持倉失敗，使用默認設置
+            leverage_data = {"contract": symbol, "leverage": str(leverage)}
+        
+        return self._request("POST", "/futures/usdt/leverage", data=leverage_data)
     
     def place_order(self, symbol: str, size: int, price: str, tif: str = "ioc") -> Dict:
         """下單"""
-        # 確保size是正確的符號（正數表示買入，負數表示賣出）
-        # 由於我們只做多，size應該是正數
+        # 確保size是正確的符號（正數表示買入）
         order_size = abs(size)
         
         order_data = {
@@ -124,15 +163,12 @@ class GateIOAPI:
             "price": price,
             "tif": tif
         }
+        
+        # 對於市價單，價格設為"0"
+        if price == "0":
+            order_data["price"] = "0"
+        
         return self._request("POST", "/futures/usdt/orders", data=order_data)
-    
-    def get_contract_info(self, symbol: str) -> Dict:
-        """獲取合約信息"""
-        contracts = self._request("GET", "/futures/usdt/contracts")
-        for contract in contracts:
-            if contract['name'] == symbol:
-                return contract
-        raise Exception(f"找不到合約: {symbol}")
 
 class RolloverBot:
     def __init__(self):
@@ -418,6 +454,15 @@ async def execute_rollover_strategy(update: Update, user_id: int):
             await update.message.reply_text(f"✅ API連接測試成功，當前價格: {ticker[0]['last']}")
         except Exception as e:
             await update.message.reply_text(f"❌ API連接測試失敗: {str(e)}")
+            return
+        
+        # 測試設置槓桿
+        try:
+            await update.message.reply_text("🔧 測試設置槓桿...")
+            leverage_result = bot.api.set_leverage(symbol, leverage)
+            await update.message.reply_text(f"✅ 槓桿設置測試成功")
+        except Exception as e:
+            await update.message.reply_text(f"❌ 槓桿設置測試失敗: {str(e)}")
             return
         
         # 下初始訂單
