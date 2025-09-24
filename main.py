@@ -75,19 +75,24 @@ class GateIOAPI:
         headers = self._sign_request(method, endpoint, query_string, body)
         headers["Content-Type"] = "application/json"
         
-        if method == "GET":
-            response = requests.get(f"{url}?{query_string}", headers=headers)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, data=body)
-        elif method == "DELETE":
-            response = requests.delete(f"{url}?{query_string}", headers=headers)
-        else:
-            raise ValueError(f"不支持的HTTP方法: {method}")
-        
-        if response.status_code != 200:
-            raise Exception(f"API錯誤: {response.status_code} - {response.text}")
-        
-        return response.json()
+        try:
+            if method == "GET":
+                response = requests.get(f"{url}?{query_string}", headers=headers, timeout=10)
+            elif method == "POST":
+                response = requests.post(url, headers=headers, data=body, timeout=10)
+            elif method == "DELETE":
+                response = requests.delete(f"{url}?{query_string}", headers=headers, timeout=10)
+            else:
+                raise ValueError(f"不支持的HTTP方法: {method}")
+            
+            if response.status_code != 200:
+                raise Exception(f"API錯誤: {response.status_code} - {response.text}")
+            
+            return response.json()
+        except requests.exceptions.Timeout:
+            raise Exception("API請求超時")
+        except Exception as e:
+            raise Exception(f"API請求失敗: {str(e)}")
     
     def get_ticker(self, symbol: str) -> Dict:
         """獲取交易對價格"""
@@ -110,10 +115,16 @@ class GateIOAPI:
     
     def get_contract_info(self, symbol: str) -> Dict:
         """獲取合約信息"""
-        return self._request("GET", "/futures/usdt/contracts", {"contract": symbol})
+        contracts = self._request("GET", "/futures/usdt/contracts")
+        for contract in contracts:
+            if contract['name'] == symbol:
+                return contract
+        raise Exception(f"找不到合約: {symbol}")
 
 class RolloverBot:
     def __init__(self):
+        if not GATE_API_KEY or not GATE_API_SECRET:
+            raise Exception("請設置 GATE_API_KEY 和 GATE_API_SECRET 環境變數")
         self.api = GateIOAPI(GATE_API_KEY, GATE_API_SECRET)
         
     def calculate_contract_size(self, symbol: str, price: float, margin: float, leverage: int) -> int:
@@ -146,6 +157,7 @@ class RolloverBot:
             
             # 下單（市價單價格設為"0"）
             result = self.api.place_order(symbol, contract_size, "0", "ioc")
+            logger.info(f"市價單下單結果: {result}")
             return True
         except Exception as e:
             logger.error(f"下單錯誤: {e}")
@@ -159,6 +171,7 @@ class RolloverBot:
             
             # 下單
             result = self.api.place_order(symbol, contract_size, str(price), "gtc")
+            logger.info(f"限價單下單結果: {result}")
             return True
         except Exception as e:
             logger.error(f"下單錯誤: {e}")
@@ -192,19 +205,29 @@ class RolloverBot:
         
         return orders
 
-# 初始化機器人
-bot = RolloverBot()
+# 全局機器人實例
+bot = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """開始對話"""
+    global bot
     user_id = update.message.from_user.id
-    user_data[user_id] = {}
     
-    await update.message.reply_text(
-        "🤖 歡迎使用自動滾倉機器人！\n\n"
-        "請輸入交易對（例如: BTC_USDT）:"
-    )
-    return SELECTING_SYMBOL
+    try:
+        # 初始化機器人（如果尚未初始化）
+        if bot is None:
+            bot = RolloverBot()
+        
+        user_data[user_id] = {}
+        
+        await update.message.reply_text(
+            "🤖 歡迎使用自動滾倉機器人！\n\n"
+            "請輸入交易對（例如: BTC_USDT）:"
+        )
+        return SELECTING_SYMBOL
+    except Exception as e:
+        await update.message.reply_text(f"❌ 初始化失敗: {str(e)}")
+        return ConversationHandler.END
 
 async def symbol_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """接收交易對"""
@@ -272,7 +295,7 @@ async def entry_price_received(update: Update, context: ContextTypes.DEFAULT_TYP
         
         await update.message.reply_text(
             f"進場價格: {entry_price}\n"
-            "請輸入滾倉次數:"
+            "請輸入滾倉次數（1-10）:"
         )
         return SELECTING_ROLL_COUNT
     except ValueError:
@@ -284,8 +307,8 @@ async def roll_count_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.message.from_user.id
     try:
         roll_count = int(update.message.text)
-        if roll_count <= 0 or roll_count > 20:
-            await update.message.reply_text("滾倉次數必須在1-20之間，請重新輸入:")
+        if roll_count <= 0 or roll_count > 10:  # 限制最大10次
+            await update.message.reply_text("滾倉次數必須在1-10之間，請重新輸入:")
             return SELECTING_ROLL_COUNT
         
         user_data[user_id]['roll_count'] = roll_count
@@ -307,6 +330,10 @@ async def order_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     """接收下單方式"""
     user_id = update.message.from_user.id
     order_type = update.message.text
+    
+    if order_type not in ['市價單', '限價單']:
+        await update.message.reply_text("請選擇『市價單』或『限價單』:")
+        return SELECTING_ORDER_TYPE
     
     user_data[user_id]['order_type'] = order_type
     
@@ -343,7 +370,7 @@ async def confirmation_received(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.message.from_user.id
     response = update.message.text.lower()
     
-    if response == '是':
+    if response == '是' or response == 'yes':
         await execute_rollover_strategy(update, user_id)
         return ConversationHandler.END
     else:
@@ -365,6 +392,10 @@ async def execute_rollover_strategy(update: Update, user_id: int):
         
         # 下初始訂單
         initial_contract_size = bot.calculate_contract_size(symbol, entry_price, margin, leverage)
+        
+        if initial_contract_size <= 0:
+            await update.message.reply_text("❌ 合約數量計算錯誤，請檢查參數")
+            return
         
         if order_type == '市價單':
             success = await bot.place_market_order(symbol, initial_contract_size, leverage)
@@ -389,22 +420,25 @@ async def execute_rollover_strategy(update: Update, user_id: int):
         
         successful_orders = 0
         for order in orders:
-            success = await bot.place_limit_order(
-                symbol, 
-                order['contract_size'], 
-                order['price'], 
-                leverage
-            )
-            
-            if success:
-                successful_orders += 1
-                await update.message.reply_text(
-                    f"✅ 滾倉訂單 #{order['rollover_number']} 設置成功\n"
-                    f"價格: ${order['price']:.2f}\n"
-                    f"合約: {order['contract_size']}張"
+            try:
+                success = await bot.place_limit_order(
+                    symbol, 
+                    order['contract_size'], 
+                    order['price'], 
+                    leverage
                 )
-            else:
-                await update.message.reply_text(f"❌ 滾倉訂單 #{order['rollover_number']} 設置失敗")
+                
+                if success:
+                    successful_orders += 1
+                    await update.message.reply_text(
+                        f"✅ 滾倉訂單 #{order['rollover_number']} 設置成功\n"
+                        f"價格: ${order['price']:.2f}\n"
+                        f"合約: {order['contract_size']}張"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ 滾倉訂單 #{order['rollover_number']} 設置失敗")
+            except Exception as e:
+                await update.message.reply_text(f"❌ 滾倉訂單 #{order['rollover_number']} 錯誤: {str(e)}")
         
         await update.message.reply_text(
             f"🎯 策略執行完成！\n"
@@ -423,17 +457,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """錯誤處理"""
     logger.error(f"更新 {update} 導致錯誤 {context.error}")
-    await update.message.reply_text("發生錯誤，請稍後再試。")
+    if update and update.message:
+        await update.message.reply_text("發生錯誤，請稍後再試。")
 
 def main():
     """主函數"""
     # 檢查環境變數
     if not os.getenv("TELEGRAM_BOT_TOKEN"):
         logger.error("請設置 TELEGRAM_BOT_TOKEN 環境變數")
-        return
-    
-    if not os.getenv("GATE_API_KEY") or not os.getenv("GATE_API_SECRET"):
-        logger.error("請設置 GATE_API_KEY 和 GATE_API_SECRET 環境變數")
         return
     
     # 創建應用程序
@@ -459,7 +490,10 @@ def main():
     
     # 啟動機器人
     print("🤖 自動滾倉機器人已啟動...")
-    application.run_polling()
+    try:
+        application.run_polling()
+    except Exception as e:
+        logger.error(f"機器人啟動失敗: {e}")
 
 if __name__ == '__main__':
     main()
