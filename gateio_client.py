@@ -30,19 +30,41 @@ class GateIOClient:
     def get_account_balance(self):
         """獲取帳戶餘額"""
         try:
-            # 新版本API返回的是FuturesAccount對象，不是列表
-            account = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
+            # 調試：先打印返回的對象類型
+            account_data = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
+            print(f"Account data type: {type(account_data)}")
+            print(f"Account data: {account_data}")
             
-            # 直接訪問對象屬性
-            if hasattr(account, 'total'):
-                return float(account.total)
-            else:
-                # 如果返回的是列表（舊版本兼容）
-                if isinstance(account, list) and len(account) > 0:
-                    return float(account[0].total)
+            # 根據實際返回的數據結構進行處理
+            if hasattr(account_data, 'total'):
+                # 如果是單一對象且有total屬性
+                return float(account_data.total)
+            elif isinstance(account_data, list) and len(account_data) > 0:
+                # 如果是列表
+                if hasattr(account_data[0], 'total'):
+                    return float(account_data[0].total)
                 else:
-                    return 0.0
+                    # 嘗試其他可能的屬性名
+                    for attr in ['available', 'balance', 'total_balance']:
+                        if hasattr(account_data[0], attr):
+                            return float(getattr(account_data[0], attr))
+            else:
+                # 嘗試直接訪問可能存在的屬性
+                for attr in ['total', 'available', 'balance']:
+                    if hasattr(account_data, attr):
+                        return float(getattr(account_data, attr))
+            
+            # 如果以上都不行，嘗試轉換為字典
+            if hasattr(account_data, '__dict__'):
+                account_dict = account_data.__dict__
+                for key in ['total', 'available', 'balance', 'total_balance']:
+                    if key in account_dict:
+                        return float(account_dict[key])
+            
+            return 0.0
+            
         except Exception as e:
+            print(f"Error details: {str(e)}")
             raise Exception(f"獲取餘額失敗: {str(e)}")
     
     def set_leverage(self, symbol, leverage):
