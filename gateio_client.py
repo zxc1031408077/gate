@@ -30,8 +30,10 @@ class GateIOClient:
     def get_account_balance(self):
         """獲取帳戶餘額"""
         try:
-            account = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
-            return float(account.total) if account else 0.0
+            accounts = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
+            if accounts:
+                return float(accounts[0].total)  # 新版本返回列表
+            return 0.0
         except Exception as e:
             raise Exception(f"獲取餘額失敗: {str(e)}")
     
@@ -39,7 +41,7 @@ class GateIOClient:
         """設定槓桿"""
         try:
             leverage_str = f"{leverage}"
-            self.futures_api.update_position_leverage(
+            result = self.futures_api.update_position_leverage(
                 settle=SETTLE_CURRENCY,
                 contract=symbol,
                 leverage=leverage_str
@@ -54,8 +56,13 @@ class GateIOClient:
             # 獲取合約資訊
             contract = self.futures_api.get_futures_contract(settle=SETTLE_CURRENCY, contract=symbol)
             
-            # 計算合約價值
-            contract_size = float(contract.quanto_multiplier) if hasattr(contract, 'quanto_multiplier') else 1.0
+            # 計算合約價值 - 新版本API可能需要調整
+            if hasattr(contract, 'quanto_multiplier') and contract.quanto_multiplier:
+                contract_size = float(contract.quanto_multiplier)
+            elif hasattr(contract, 'size') and contract.size:
+                contract_size = float(contract.size)
+            else:
+                contract_size = 1.0
             
             # 計算可開倉張數
             total_value = margin * leverage
@@ -72,7 +79,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price='0',  # 市價單價格設為0
-                side='long' if side == 'long' else 'short',
+                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
                 time_in_force='ioc'
             )
             result = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order)
@@ -87,7 +94,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price=str(price),
-                side='long' if side == 'long' else 'short',
+                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
                 time_in_force='gtc'  # 一直有效直到取消
             )
             result = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order)
@@ -103,7 +110,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price='0',  # 市價單
-                side='long' if side == 'long' else 'short',
+                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
                 time_in_force='ioc',
                 stop_trigger=str(trigger_price)
             )
@@ -127,7 +134,7 @@ class GateIOClient:
     def cancel_all_orders(self, symbol):
         """取消所有訂單"""
         try:
-            self.futures_api.cancel_futures_orders(
+            result = self.futures_api.cancel_futures_orders(
                 settle=SETTLE_CURRENCY,
                 contract=symbol
             )
