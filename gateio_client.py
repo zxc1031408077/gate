@@ -30,10 +30,18 @@ class GateIOClient:
     def get_account_balance(self):
         """獲取帳戶餘額"""
         try:
-            accounts = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
-            if accounts:
-                return float(accounts[0].total)  # 新版本返回列表
-            return 0.0
+            # 新版本API返回的是FuturesAccount對象，不是列表
+            account = self.futures_api.list_futures_accounts(settle=SETTLE_CURRENCY)
+            
+            # 直接訪問對象屬性
+            if hasattr(account, 'total'):
+                return float(account.total)
+            else:
+                # 如果返回的是列表（舊版本兼容）
+                if isinstance(account, list) and len(account) > 0:
+                    return float(account[0].total)
+                else:
+                    return 0.0
         except Exception as e:
             raise Exception(f"獲取餘額失敗: {str(e)}")
     
@@ -56,7 +64,7 @@ class GateIOClient:
             # 獲取合約資訊
             contract = self.futures_api.get_futures_contract(settle=SETTLE_CURRENCY, contract=symbol)
             
-            # 計算合約價值 - 新版本API可能需要調整
+            # 計算合約價值
             if hasattr(contract, 'quanto_multiplier') and contract.quanto_multiplier:
                 contract_size = float(contract.quanto_multiplier)
             elif hasattr(contract, 'size') and contract.size:
@@ -79,7 +87,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price='0',  # 市價單價格設為0
-                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
+                side='buy' if side == 'long' else 'sell',
                 time_in_force='ioc'
             )
             result = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order)
@@ -94,7 +102,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price=str(price),
-                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
+                side='buy' if side == 'long' else 'sell',
                 time_in_force='gtc'  # 一直有效直到取消
             )
             result = self.futures_api.create_futures_order(settle=SETTLE_CURRENCY, futures_order=order)
@@ -110,7 +118,7 @@ class GateIOClient:
                 contract=symbol,
                 size=size,
                 price='0',  # 市價單
-                side='buy' if side == 'long' else 'sell',  # 新版本使用 buy/sell
+                side='buy' if side == 'long' else 'sell',
                 time_in_force='ioc',
                 stop_trigger=str(trigger_price)
             )
